@@ -227,17 +227,18 @@ func (processor *Processor) ProcessBlock(block *ship.GetBlocksResultV0) {
 	if block.ThisBlock.BlockNum%1000 == 0 {
 		processor.Timer.EndTimer(block.ThisBlock.BlockNum)
 		bps := processor.Timer.CalculateBPS()
-		processor.StatsD.Gauge("blocks_per_second", float64(bps), nil, 1)
-		fmt.Printf("Blocks per second: %d\n", bps)
+		if bps > 0 {
+			processor.StatsD.Gauge("blocks_per_second", float64(bps), nil, 1)
+			fmt.Printf("Blocks per second: %d\n", bps)
+			// print remaining time to console
+			remainingTime := processor.Timer.CalculateRemainingTime(block.ThisBlock.BlockNum, block.Head.BlockNum, bps)
+			fmt.Printf("Estimated time to sync: %s\n", remainingTime)
+		}
 		processor.Timer.StartTimer(block.ThisBlock.BlockNum)
-
-		// print remaining time to console
-		remainingTime := processor.Timer.CalculateRemainingTime(block.ThisBlock.BlockNum, block.Head.BlockNum, bps)
-		fmt.Printf("Estimated time to sync: %s\n", remainingTime)
 	}
 
-	var txCount int = 0
-	var axCount int = 0
+	var txCount uint32 = 0
+	var axCount uint32 = 0
 
 	// Process the block traces
 	if block.Traces != nil {
@@ -245,9 +246,13 @@ func (processor *Processor) ProcessBlock(block *ship.GetBlocksResultV0) {
 		if err := block.Traces.Unpack(&unpackedTraces); err != nil {
 			log.Fatalf("Failed to unpack traces: %s\n", err)
 		} else {
-			txCount = len(unpackedTraces) - 1
+			txCount = uint32(len(unpackedTraces) - 1)
+			var blockPosition uint32 = 0
 			for _, trace := range unpackedTraces {
-				axCount += len(trace.V0.ActionTraces) - 1
+				blockPosition++
+				var traceAxCount uint32 = uint32(len(trace.V0.ActionTraces) - 1)
+				axCount += traceAxCount
+				var fistGlobalSequence uint64 = 0
 				// Actions
 				for _, actionTraceVar := range trace.V0.ActionTraces {
 					var act_trace *ship.ActionTraceV1
@@ -269,6 +274,10 @@ func (processor *Processor) ProcessBlock(block *ship.GetBlocksResultV0) {
 						}
 					} else {
 						act_trace = actionTraceVar.V1
+					}
+
+					if act_trace.Receipt != nil && fistGlobalSequence == 0 {
+						fistGlobalSequence = act_trace.Receipt.V0.GlobalSequence
 					}
 
 					// Check if this is a setabi action
@@ -299,6 +308,22 @@ func (processor *Processor) ProcessBlock(block *ship.GetBlocksResultV0) {
 						log.Fatalln("Failed to get abi for "+act_trace.Act.Account.String(), err)
 					}
 				}
+
+				err := processor.ChConn.Exec(
+					context.Background(),
+					"INSERT INTO transactions (tx_id, block_num, block_timestamp, sequence, block_position, ax_count, cpu_usage_us, net_usage) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+					trace.V0.ID.String(),
+					block.ThisBlock.BlockNum,
+					signedBlock.Timestamp.Time().UnixMilli(),
+					fistGlobalSequence,
+					blockPosition,
+					traceAxCount,
+					trace.V0.CPUUsageUS,
+					trace.V0.NetUsage,
+				)
+				if err != nil {
+					log.Fatalf("unable to execute query: %v\n", err)
+				}
 			}
 		}
 	}
@@ -312,11 +337,12 @@ func (processor *Processor) ProcessBlock(block *ship.GetBlocksResultV0) {
 
 	err := processor.ChConn.Exec(
 		context.Background(),
-		"INSERT INTO blocks (id, block_hash, parent_hash, block_time, tx_count, ax_count) VALUES (?, ?, ?, ?, ?, ?)",
+		"INSERT INTO blocks (id, block_hash, parent_hash, block_timestamp, producer, tx_count, ax_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		block.ThisBlock.BlockNum,
 		block.ThisBlock.BlockID.String(),
 		parentHash,
 		signedBlock.Timestamp.Time().UnixMilli(),
+		signedBlock.Producer.String(),
 		txCount,
 		axCount,
 	)
@@ -341,6 +367,9 @@ func main() {
 		log.Fatalln("Error loading .env file", err)
 	}
 
+	// Settings
+	var startFresh bool = os.Getenv("START_FRESH") == "true"
+
 	// ClickHouse connection
 	var chHost string = os.Getenv("CLICKHOUSE_HOST")
 	var chPort string = os.Getenv("CLICKHOUSE_PORT")
@@ -357,6 +386,7 @@ func main() {
 			Username: chUser,
 			Password: chPassword,
 		},
+		Debug: false,
 	})
 	if err != nil {
 		log.Fatalln("Unable to connect to ClickHouse", err)
@@ -380,13 +410,19 @@ func main() {
 
 	// Get starting block from database
 	var newStartBlock uint32
-	row := chConn.QueryRow(context.Background(), "SELECT max(id) FROM blocks")
-	err = row.Scan(&newStartBlock)
-	if err != nil {
-		if err != pgx.ErrNoRows {
-			chConn.Exec(context.Background(), "DROP DATABASE IF EXISTS "+chDatabase)
-			chConn.Exec(context.Background(), "CREATE DATABASE "+chDatabase)
-			migrateDatabase(pgUrl, chUrl)
+	if startFresh {
+		chConn.Exec(context.Background(), "DROP DATABASE IF EXISTS "+chDatabase)
+		chConn.Exec(context.Background(), "CREATE DATABASE "+chDatabase)
+		migrateDatabase(pgUrl, chUrl)
+	} else {
+		row := chConn.QueryRow(context.Background(), "SELECT max(id) FROM blocks")
+		err = row.Scan(&newStartBlock)
+		if err != nil {
+			if err != pgx.ErrNoRows {
+				chConn.Exec(context.Background(), "DROP DATABASE IF EXISTS "+chDatabase)
+				chConn.Exec(context.Background(), "CREATE DATABASE "+chDatabase)
+				migrateDatabase(pgUrl, chUrl)
+			}
 		}
 	}
 
